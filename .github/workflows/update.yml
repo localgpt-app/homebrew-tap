@@ -1,0 +1,105 @@
+# Keeps Formula/localgpt.rb at the version npm calls `latest`.
+#
+# The formula installs the `localgpt` command line out of the npm package
+# (github.com/localgpt-app/localgpt, docs/releasing.md), so a release has
+# nothing to push here, and holds no token that could. This asks npm what
+# is latest instead; when the formula is behind, it has that release's own
+# tooling render the formula (`cargo xtask formula`, at the release's tag),
+# installs it from this checkout as a tap, runs its test, and only then
+# pushes it, with this repository's own token, which the job is given.
+# While npm has no `localgpt`, or only a placeholder holding the name
+# (version 0.0.0), a run says so and does nothing.
+#
+# GitHub stops a schedule in a repository nothing has touched for 60 days.
+# A run by hand starts it again, and is also how not to wait for the hour:
+#   gh workflow run update.yml -R localgpt-app/homebrew-tap
+name: Update
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  formula:
+    name: Formula/localgpt.rb
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: What npm calls latest
+        id: npm
+        run: |
+          status=$(curl -sS -o "$RUNNER_TEMP/latest.json" -w '%{http_code}' https://registry.npmjs.org/localgpt/latest)
+          if [ "$status" = 404 ]; then
+            echo "npm has no localgpt yet"
+            exit 0
+          fi
+          if [ "$status" != 200 ]; then
+            echo "::error::registry.npmjs.org answered $status"
+            exit 1
+          fi
+          version=$(jq -r .version "$RUNNER_TEMP/latest.json")
+          # A placeholder can hold the name before the first release: it has
+          # no tag to render a formula at and no binary to install.
+          case "$version" in
+            0.0.0*)
+              echo "npm has only a placeholder ($version) yet"
+              exit 0
+              ;;
+          esac
+          if grep -qF "localgpt-$version.tgz" Formula/localgpt.rb 2> /dev/null; then
+            echo "Formula/localgpt.rb is at $version already"
+            exit 0
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The release's own tooling, at the release's tag.
+      - uses: actions/checkout@v4
+        if: steps.npm.outputs.version != ''
+        with:
+          repository: localgpt-app/localgpt
+          ref: v${{ steps.npm.outputs.version }}
+          path: localgpt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.npm.outputs.version != ''
+
+      - name: Render it, install it, test it, commit it
+        if: steps.npm.outputs.version != ''
+        env:
+          VERSION: ${{ steps.npm.outputs.version }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+        run: |
+          tarball="$RUNNER_TEMP/localgpt-$VERSION.tgz"
+          curl -fsS -o "$tarball" "https://registry.npmjs.org/localgpt/-/localgpt-$VERSION.tgz"
+          mkdir -p Formula
+          (cd localgpt && cargo xtask formula "$VERSION" "$tarball") > "$RUNNER_TEMP/localgpt.rb"
+          rm -rf localgpt
+          mv "$RUNNER_TEMP/localgpt.rb" Formula/localgpt.rb
+          cat Formula/localgpt.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/localgpt.rb
+          git commit -m "localgpt $VERSION"
+
+          # From this checkout as a tap, the way a person installs it: the
+          # tarball comes from npm again, and has to match the checksum.
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap localgpt-app/tap "$PWD"
+          brew install localgpt-app/tap/localgpt
+          brew test localgpt-app/tap/localgpt
+          test "$(localgpt --version)" = "localgpt $VERSION"
+
+          git push
